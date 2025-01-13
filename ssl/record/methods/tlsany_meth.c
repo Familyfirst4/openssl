@@ -1,5 +1,5 @@
 /*
- * Copyright 2022 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2022-2024 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -11,6 +11,8 @@
 #include "../../ssl_local.h"
 #include "../record_local.h"
 #include "recmethod_local.h"
+
+#define MIN_SSL2_RECORD_LEN     9
 
 static int tls_any_set_crypto_state(OSSL_RECORD_LAYER *rl, int level,
                                     unsigned char *key, size_t keylen,
@@ -32,14 +34,14 @@ static int tls_any_set_crypto_state(OSSL_RECORD_LAYER *rl, int level,
     return OSSL_RECORD_RETURN_SUCCESS;
 }
 
-static int tls_any_cipher(OSSL_RECORD_LAYER *rl, SSL3_RECORD *recs,
+static int tls_any_cipher(OSSL_RECORD_LAYER *rl, TLS_RL_RECORD *recs,
                           size_t n_recs, int sending, SSL_MAC_BUF *macs,
                           size_t macsize)
 {
     return 1;
 }
 
-static int tls_validate_record_header(OSSL_RECORD_LAYER *rl, SSL3_RECORD *rec)
+static int tls_validate_record_header(OSSL_RECORD_LAYER *rl, TLS_RL_RECORD *rec)
 {
     if (rec->rec_version == SSL2_VERSION) {
         /* SSLv2 format ClientHello */
@@ -137,13 +139,13 @@ static int tls_any_set_protocol_version(OSSL_RECORD_LAYER *rl, int vers)
 static int tls_any_prepare_for_encryption(OSSL_RECORD_LAYER *rl,
                                           size_t mac_size,
                                           WPACKET *thispkt,
-                                          SSL3_RECORD *thiswr)
+                                          TLS_RL_RECORD *thiswr)
 {
     /* No encryption, so nothing to do */
     return 1;
 }
 
-struct record_functions_st tls_any_funcs = {
+const struct record_functions_st tls_any_funcs = {
     tls_any_set_crypto_state,
     tls_any_cipher,
     NULL,
@@ -173,7 +175,7 @@ static int dtls_any_set_protocol_version(OSSL_RECORD_LAYER *rl, int vers)
     return 1;
 }
 
-struct record_functions_st dtls_any_funcs = {
+const struct record_functions_st dtls_any_funcs = {
     tls_any_set_crypto_state,
     tls_any_cipher,
     NULL,
@@ -183,13 +185,13 @@ struct record_functions_st dtls_any_funcs = {
     NULL,
     NULL,
     NULL,
+    tls_write_records_default,
+    tls_allocate_write_buffers_default,
+    tls_initialise_write_packets_default,
     NULL,
+    dtls_prepare_record_header,
     NULL,
-    NULL,
-    NULL,
-    NULL,
-    NULL,
-    NULL,
-    NULL,
+    tls_prepare_for_encryption_default,
+    dtls_post_encryption_processing,
     NULL
 };

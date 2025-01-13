@@ -1,5 +1,5 @@
 /*
- * Copyright 2020-2022 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2020-2024 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -535,8 +535,6 @@ static int dh_check_key_type(const void *dh, int expected_type)
 
 # define dh_evp_type            EVP_PKEY_DH
 # define dhx_evp_type           EVP_PKEY_DHX
-# define dh_input_type          "DH"
-# define dhx_input_type         "DHX"
 # define dh_pem_type            "DH"
 # define dhx_pem_type           "X9.42 DH"
 #endif
@@ -632,7 +630,6 @@ static int dsa_pki_priv_to_der(const void *dsa, unsigned char **pder)
 
 # define dsa_check_key_type     NULL
 # define dsa_evp_type           EVP_PKEY_DSA
-# define dsa_input_type         "DSA"
 # define dsa_pem_type           "DSA"
 #endif
 
@@ -736,19 +733,25 @@ static int ec_pki_priv_to_der(const void *veckey, unsigned char **pder)
 
 # define ec_check_key_type      NULL
 # define ec_evp_type            EVP_PKEY_EC
-# define ec_input_type          "EC"
 # define ec_pem_type            "EC"
 
 # ifndef OPENSSL_NO_SM2
-#  define sm2_evp_type          EVP_PKEY_SM2
-#  define sm2_input_type        "SM2"
+/*
+ * Albeit SM2 is a slightly different algorithm than ECDSA, the key type
+ * encoding (in all places where an AlgorithmIdentifier is produced, such
+ * as PrivateKeyInfo and SubjectPublicKeyInfo) is the same as for ECC keys
+ * according to the example in GM/T 0015-2012, appendix D.2.
+ * This leaves the distinction of SM2 keys to the EC group (which is found
+ * in AlgorithmIdentified.params).
+ */
+#  define sm2_evp_type          ec_evp_type
 #  define sm2_pem_type          "SM2"
 # endif
 #endif
 
 /* ---------------------------------------------------------------------- */
 
-#ifndef OPENSSL_NO_EC
+#ifndef OPENSSL_NO_ECX
 # define prepare_ecx_params NULL
 
 static int ecx_spki_pub_to_der(const void *vecxkey, unsigned char **pder)
@@ -806,10 +809,6 @@ static int ecx_pki_priv_to_der(const void *vecxkey, unsigned char **pder)
 # define ed448_evp_type         EVP_PKEY_ED448
 # define x25519_evp_type        EVP_PKEY_X25519
 # define x448_evp_type          EVP_PKEY_X448
-# define ed25519_input_type     "ED25519"
-# define ed448_input_type       "ED448"
-# define x25519_input_type      "X25519"
-# define x448_input_type        "X448"
 # define ed25519_pem_type       "ED25519"
 # define ed448_pem_type         "ED448"
 # define x25519_pem_type        "X25519"
@@ -856,14 +855,17 @@ static int prepare_rsa_params(const void *rsa, int nid, int save,
                 case 1:
                     if ((str = OPENSSL_malloc(str_sz)) == NULL
                         || !WPACKET_init_der(&pkt, str, str_sz)) {
+                        WPACKET_cleanup(&pkt);
                         goto err;
                     }
                     break;
                 }
                 if (!ossl_DER_w_RSASSA_PSS_params(&pkt, -1, pss)
                     || !WPACKET_finish(&pkt)
-                    || !WPACKET_get_total_written(&pkt, &str_sz))
+                    || !WPACKET_get_total_written(&pkt, &str_sz)) {
+                    WPACKET_cleanup(&pkt);
                     goto err;
+                }
                 WPACKET_cleanup(&pkt);
 
                 /*
@@ -919,8 +921,6 @@ static int rsa_check_key_type(const void *rsa, int expected_type)
 
 #define rsa_evp_type            EVP_PKEY_RSA
 #define rsapss_evp_type         EVP_PKEY_RSA_PSS
-#define rsa_input_type          "RSA"
-#define rsapss_input_type       "RSA-PSS"
 #define rsa_pem_type            "RSA"
 #define rsapss_pem_type         "RSA-PSS"
 
@@ -1293,7 +1293,7 @@ static int key2any_encode(struct key2any_ctx_st *ctx, OSSL_CORE_BIO *cout,
           (void (*)(void))impl##_to_##kind##_##output##_free_object },      \
         { OSSL_FUNC_ENCODER_ENCODE,                                         \
           (void (*)(void))impl##_to_##kind##_##output##_encode },           \
-        { 0, NULL }                                                         \
+        OSSL_DISPATCH_END                                                   \
     }
 
 /*
@@ -1391,6 +1391,7 @@ MAKE_ENCODER(sm2, ec, EVP_PKEY_EC, PrivateKeyInfo, pem);
 MAKE_ENCODER(sm2, ec, EVP_PKEY_EC, SubjectPublicKeyInfo, der);
 MAKE_ENCODER(sm2, ec, EVP_PKEY_EC, SubjectPublicKeyInfo, pem);
 # endif
+# ifndef OPENSSL_NO_ECX
 MAKE_ENCODER(ed25519, ecx, EVP_PKEY_ED25519, EncryptedPrivateKeyInfo, der);
 MAKE_ENCODER(ed25519, ecx, EVP_PKEY_ED25519, EncryptedPrivateKeyInfo, pem);
 MAKE_ENCODER(ed25519, ecx, EVP_PKEY_ED25519, PrivateKeyInfo, der);
@@ -1415,6 +1416,7 @@ MAKE_ENCODER(x448, ecx, EVP_PKEY_ED448, PrivateKeyInfo, der);
 MAKE_ENCODER(x448, ecx, EVP_PKEY_ED448, PrivateKeyInfo, pem);
 MAKE_ENCODER(x448, ecx, EVP_PKEY_ED448, SubjectPublicKeyInfo, der);
 MAKE_ENCODER(x448, ecx, EVP_PKEY_ED448, SubjectPublicKeyInfo, pem);
+# endif
 #endif
 
 /*

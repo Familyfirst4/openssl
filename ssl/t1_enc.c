@@ -1,5 +1,5 @@
 /*
- * Copyright 1995-2022 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 1995-2024 The OpenSSL Project Authors. All Rights Reserved.
  * Copyright 2005 Nokia. All rights reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
@@ -101,44 +101,6 @@ static int tls1_generate_key_block(SSL_CONNECTION *s, unsigned char *km,
     return ret;
 }
 
-int tls_provider_set_tls_params(SSL_CONNECTION *s, EVP_CIPHER_CTX *ctx,
-                                const EVP_CIPHER *ciph,
-                                const EVP_MD *md)
-{
-    /*
-     * Provided cipher, the TLS padding/MAC removal is performed provider
-     * side so we need to tell the ctx about our TLS version and mac size
-     */
-    OSSL_PARAM params[3], *pprm = params;
-    size_t macsize = 0;
-    int imacsize = -1;
-
-    if ((EVP_CIPHER_get_flags(ciph) & EVP_CIPH_FLAG_AEAD_CIPHER) == 0
-               /*
-                * We look at s->ext.use_etm instead of SSL_READ_ETM() or
-                * SSL_WRITE_ETM() because this test applies to both reading
-                * and writing.
-                */
-            && !s->ext.use_etm)
-        imacsize = EVP_MD_get_size(md);
-    if (imacsize >= 0)
-        macsize = (size_t)imacsize;
-
-    *pprm++ = OSSL_PARAM_construct_int(OSSL_CIPHER_PARAM_TLS_VERSION,
-                                       &s->version);
-    *pprm++ = OSSL_PARAM_construct_size_t(OSSL_CIPHER_PARAM_TLS_MAC_SIZE,
-                                          &macsize);
-    *pprm = OSSL_PARAM_construct_end();
-
-    if (!EVP_CIPHER_CTX_set_params(ctx, params)) {
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
-        return 0;
-    }
-
-    return 1;
-}
-
-
 static int tls_iv_length_within_key_block(const EVP_CIPHER *c)
 {
     /* If GCM/CCM mode only part of IV comes from PRF */
@@ -154,23 +116,19 @@ int tls1_change_cipher_state(SSL_CONNECTION *s, int which)
 {
     unsigned char *p, *mac_secret;
     unsigned char *key, *iv;
-    EVP_CIPHER_CTX *dd;
     const EVP_CIPHER *c;
     const SSL_COMP *comp = NULL;
     const EVP_MD *m;
     int mac_type;
     size_t mac_secret_size;
-    EVP_MD_CTX *mac_ctx;
-    EVP_PKEY *mac_key;
     size_t n, i, j, k, cl;
     int iivlen;
-    int reuse_dd = 0;
-    SSL_CTX *sctx = SSL_CONNECTION_GET_CTX(s);
     /*
      * Taglen is only relevant for CCM ciphersuites. Other ciphersuites
      * ignore this value so we can default it to 0.
      */
     size_t taglen = 0;
+    int direction;
 
     c = s->s3.tmp.new_sym_enc;
     m = s->s3.tmp.new_hash;
@@ -213,12 +171,25 @@ int tls1_change_cipher_state(SSL_CONNECTION *s, int which)
         goto err;
     }
 
-    if (EVP_CIPHER_get_mode(c) == EVP_CIPH_CCM_MODE) {
+    switch (EVP_CIPHER_get_mode(c)) {
+    case EVP_CIPH_GCM_MODE:
+        taglen = EVP_GCM_TLS_TAG_LEN;
+        break;
+    case EVP_CIPH_CCM_MODE:
         if ((s->s3.tmp.new_cipher->algorithm_enc
                 & (SSL_AES128CCM8 | SSL_AES256CCM8)) != 0)
             taglen = EVP_CCM8_TLS_TAG_LEN;
         else
             taglen = EVP_CCM_TLS_TAG_LEN;
+        break;
+    default:
+        if (EVP_CIPHER_is_a(c, "CHACHA20-POLY1305")) {
+            taglen = EVP_CHACHAPOLY_TLS_TAG_LEN;
+        } else {
+            /* MAC secret size corresponds to the MAC output size */
+            taglen = s->s3.tmp.new_mac_secret_size;
+        }
+        break;
     }
 
     if (which & SSL3_CC_READ) {
@@ -237,18 +208,7 @@ int tls1_change_cipher_state(SSL_CONNECTION *s, int which)
         else
             s->mac_flags &= ~SSL_MAC_FLAG_READ_MAC_TLSTREE;
 
-        if (!ssl_set_new_record_layer(s, s->version,
-                                      OSSL_RECORD_DIRECTION_READ,
-                                      OSSL_RECORD_PROTECTION_LEVEL_APPLICATION,
-                                      key, cl, iv, (size_t)k, mac_secret,
-                                      mac_secret_size, c, taglen, mac_type,
-                                      m, comp)) {
-            /* SSLfatal already called */
-            goto err;
-        }
-
-        /* TODO(RECLAYER): Temporary - remove me when DTLS write rlayer done*/
-        goto done;
+        direction = OSSL_RECORD_DIRECTION_READ;
     } else {
         if (s->ext.use_etm)
             s->s3.flags |= TLS1_FLAGS_ENCRYPT_THEN_MAC_WRITE;
@@ -265,130 +225,21 @@ int tls1_change_cipher_state(SSL_CONNECTION *s, int which)
         else
             s->mac_flags &= ~SSL_MAC_FLAG_WRITE_MAC_TLSTREE;
 
-        if (!ssl_set_new_record_layer(s, s->version,
-                                      OSSL_RECORD_DIRECTION_WRITE,
-                                      OSSL_RECORD_PROTECTION_LEVEL_APPLICATION,
-                                      key, cl, iv, (size_t)k, mac_secret,
-                                      mac_secret_size, c, taglen, mac_type,
-                                      m, comp)) {
-            /* SSLfatal already called */
-            goto err;
-        }
-
-        /* TODO(RECLAYER): Temporary - remove me when DTLS write rlayer done*/
-        if (!SSL_CONNECTION_IS_DTLS(s))
-            goto done;
-
-        if (s->enc_write_ctx != NULL && !SSL_CONNECTION_IS_DTLS(s)) {
-            reuse_dd = 1;
-        } else if ((s->enc_write_ctx = EVP_CIPHER_CTX_new()) == NULL) {
-            SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_EVP_LIB);
-            goto err;
-        }
-        dd = s->enc_write_ctx;
-        if (SSL_CONNECTION_IS_DTLS(s)) {
-            mac_ctx = EVP_MD_CTX_new();
-            if (mac_ctx == NULL) {
-                SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_EVP_LIB);
-                goto err;
-            }
-            s->write_hash = mac_ctx;
-        } else {
-            mac_ctx = ssl_replace_hash(&s->write_hash, NULL);
-            if (mac_ctx == NULL) {
-                SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_SSL_LIB);
-                goto err;
-            }
-        }
-#ifndef OPENSSL_NO_COMP
-        COMP_CTX_free(s->compress);
-        s->compress = NULL;
-        if (comp != NULL) {
-            s->compress = COMP_CTX_new(comp->method);
-            if (s->compress == NULL) {
-                SSLfatal(s, SSL_AD_INTERNAL_ERROR,
-                         SSL_R_COMPRESSION_LIBRARY_ERROR);
-                goto err;
-            }
-        }
-#endif
-        /*
-         * this is done by dtls1_reset_seq_numbers for DTLS
-         */
-        if (!SSL_CONNECTION_IS_DTLS(s))
-            RECORD_LAYER_reset_write_sequence(&s->rlayer);
+        direction = OSSL_RECORD_DIRECTION_WRITE;
     }
 
-    if (reuse_dd)
-        EVP_CIPHER_CTX_reset(dd);
+    if (SSL_CONNECTION_IS_DTLS(s))
+        dtls1_increment_epoch(s, which);
 
-    if (!(EVP_CIPHER_get_flags(c) & EVP_CIPH_FLAG_AEAD_CIPHER)) {
-        if (mac_type == EVP_PKEY_HMAC) {
-            mac_key = EVP_PKEY_new_raw_private_key_ex(sctx->libctx, "HMAC",
-                                                      sctx->propq, mac_secret,
-                                                      mac_secret_size);
-        } else {
-            /*
-             * If its not HMAC then the only other types of MAC we support are
-             * the GOST MACs, so we need to use the old style way of creating
-             * a MAC key.
-             */
-            mac_key = EVP_PKEY_new_mac_key(mac_type, NULL, mac_secret,
-                                           (int)mac_secret_size);
-        }
-        if (mac_key == NULL
-            || EVP_DigestSignInit_ex(mac_ctx, NULL, EVP_MD_get0_name(m),
-                                     sctx->libctx, sctx->propq, mac_key,
-                                     NULL) <= 0) {
-            EVP_PKEY_free(mac_key);
-            SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
-            goto err;
-        }
-        EVP_PKEY_free(mac_key);
-    }
-
-    OSSL_TRACE_BEGIN(TLS) {
-        BIO_printf(trc_out, "which = %04X, mac key:\n", which);
-        BIO_dump_indent(trc_out, mac_secret, i, 4);
-    } OSSL_TRACE_END(TLS);
-
-    if (EVP_CIPHER_get_mode(c) == EVP_CIPH_GCM_MODE) {
-        if (!EVP_CipherInit_ex(dd, c, NULL, key, NULL, (which & SSL3_CC_WRITE))
-            || EVP_CIPHER_CTX_ctrl(dd, EVP_CTRL_GCM_SET_IV_FIXED, (int)k,
-                                    iv) <= 0) {
-            SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
-            goto err;
-        }
-    } else if (EVP_CIPHER_get_mode(c) == EVP_CIPH_CCM_MODE) {
-        if (!EVP_CipherInit_ex(dd, c, NULL, NULL, NULL, (which & SSL3_CC_WRITE))
-            || (EVP_CIPHER_CTX_ctrl(dd, EVP_CTRL_AEAD_SET_IVLEN, 12, NULL) <= 0)
-            || (EVP_CIPHER_CTX_ctrl(dd, EVP_CTRL_AEAD_SET_TAG, taglen, NULL) <= 0)
-            || (EVP_CIPHER_CTX_ctrl(dd, EVP_CTRL_CCM_SET_IV_FIXED, (int)k, iv) <= 0)
-            || !EVP_CipherInit_ex(dd, NULL, NULL, key, NULL, -1)) {
-            SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
-            goto err;
-        }
-    } else {
-        if (!EVP_CipherInit_ex(dd, c, NULL, key, iv, (which & SSL3_CC_WRITE))) {
-            SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
-            goto err;
-        }
-    }
-    /* Needed for "composite" AEADs, such as RC4-HMAC-MD5 */
-    if ((EVP_CIPHER_get_flags(c) & EVP_CIPH_FLAG_AEAD_CIPHER)
-        && mac_secret_size != 0
-        && EVP_CIPHER_CTX_ctrl(dd, EVP_CTRL_AEAD_SET_MAC_KEY,
-                               (int)mac_secret_size, mac_secret) <= 0) {
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
-        goto err;
-    }
-    if (EVP_CIPHER_get0_provider(c) != NULL
-            && !tls_provider_set_tls_params(s, dd, c, m)) {
+    if (!ssl_set_new_record_layer(s, s->version, direction,
+                                    OSSL_RECORD_PROTECTION_LEVEL_APPLICATION,
+                                    NULL, 0, key, cl, iv, (size_t)k, mac_secret,
+                                    mac_secret_size, c, taglen, mac_type,
+                                    m, comp, NULL)) {
         /* SSLfatal already called */
         goto err;
     }
 
- done:
     OSSL_TRACE_BEGIN(TLS) {
         BIO_printf(trc_out, "which = %04X, key:\n", which);
         BIO_dump_indent(trc_out, key, EVP_CIPHER_get_key_length(c), 4);
@@ -576,6 +427,15 @@ int tls1_export_keying_material(SSL_CONNECTION *s, unsigned char *out,
     unsigned char *val = NULL;
     size_t vallen = 0, currentvalpos;
     int rv = 0;
+
+    /*
+     * RFC 5705 embeds context length as uint16; reject longer context
+     * before proceeding.
+     */
+    if (contextlen > 0xffff) {
+        ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_INVALID_ARGUMENT);
+        return 0;
+    }
 
     /*
      * construct PRF arguments we construct the PRF argument ourself rather

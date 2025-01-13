@@ -1,5 +1,5 @@
 /*
- * Copyright 2022 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2022-2024 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -11,6 +11,7 @@
 #include <openssl/core_names.h>
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
+#include "internal/ssl3_cbc.h"
 #include "../../ssl_local.h"
 #include "../record_local.h"
 #include "recmethod_local.h"
@@ -116,11 +117,18 @@ static int tls1_set_crypto_state(OSSL_RECORD_LAYER *rl, int level,
         ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
         return OSSL_RECORD_RETURN_FATAL;
     }
-    if (EVP_CIPHER_get0_provider(ciph) != NULL
-            && !ossl_set_tls_provider_parameters(rl, ciph_ctx, ciph, md))
-        return OSSL_RECORD_RETURN_FATAL;
 
-    /* Calculate the explict IV length */
+    /*
+     * The cipher we actually ended up using in the EVP_CIPHER_CTX may be
+     * different to that in ciph if we have an ENGINE in use
+     */
+    if (EVP_CIPHER_get0_provider(EVP_CIPHER_CTX_get0_cipher(ciph_ctx)) != NULL
+            && !ossl_set_tls_provider_parameters(rl, ciph_ctx, ciph, md)) {
+        /* ERR_raise already called */
+        return OSSL_RECORD_RETURN_FATAL;
+    }
+
+    /* Calculate the explicit IV length */
     if (RLAYER_USE_EXPLICIT_IV(rl)) {
         int mode = EVP_CIPHER_CTX_get_mode(ciph_ctx);
         int eivlen = 0;
@@ -156,13 +164,15 @@ static int tls1_set_crypto_state(OSSL_RECORD_LAYER *rl, int level,
  *       decryption failed, or Encrypt-then-mac decryption failed.
  *    1: Success or Mac-then-encrypt decryption failed (MAC will be randomised)
  */
-static int tls1_cipher(OSSL_RECORD_LAYER *rl, SSL3_RECORD *recs, size_t n_recs,
-                       int sending, SSL_MAC_BUF *macs, size_t macsize)
+static int tls1_cipher(OSSL_RECORD_LAYER *rl, TLS_RL_RECORD *recs,
+                       size_t n_recs, int sending, SSL_MAC_BUF *macs,
+                       size_t macsize)
 {
     EVP_CIPHER_CTX *ds;
     size_t reclen[SSL_MAX_PIPELINES];
     unsigned char buf[SSL_MAX_PIPELINES][EVP_AEAD_TLS1_AAD_LEN];
-    int i, pad = 0, tmpr, provided;
+    unsigned char *data[SSL_MAX_PIPELINES];
+    int pad = 0, tmpr, provided;
     size_t bs, ctr, padnum, loop;
     unsigned char padval;
     const EVP_CIPHER *enc;
@@ -219,6 +229,11 @@ static int tls1_cipher(OSSL_RECORD_LAYER *rl, SSL3_RECORD *recs, size_t n_recs,
 
     bs = EVP_CIPHER_get_block_size(EVP_CIPHER_CTX_get0_cipher(ds));
 
+    if (bs == 0) {
+        RLAYERfatal(rl, SSL_AD_INTERNAL_ERROR, SSL_R_BAD_CIPHER);
+        return 0;
+    }
+
     if (n_recs > 1) {
         if ((EVP_CIPHER_get_flags(EVP_CIPHER_CTX_get0_cipher(ds))
                  & EVP_CIPH_FLAG_PIPELINE) == 0) {
@@ -247,10 +262,9 @@ static int tls1_cipher(OSSL_RECORD_LAYER *rl, SSL3_RECORD *recs, size_t n_recs,
                 memcpy(buf[ctr], dtlsseq, 8);
             } else {
                 memcpy(buf[ctr], seq, 8);
-                for (i = 7; i >= 0; i--) { /* increment */
-                    ++seq[i];
-                    if (seq[i] != 0)
-                        break;
+                if (!tls_increment_sequence_ctr(rl)) {
+                    /* RLAYERfatal already called */
+                    return 0;
                 }
             }
 
@@ -299,8 +313,6 @@ static int tls1_cipher(OSSL_RECORD_LAYER *rl, SSL3_RECORD *recs, size_t n_recs,
         }
     }
     if (n_recs > 1) {
-        unsigned char *data[SSL_MAX_PIPELINES];
-
         /* Set the output buffers */
         for (ctr = 0; ctr < n_recs; ctr++)
             data[ctr] = recs[ctr].data;
@@ -324,7 +336,6 @@ static int tls1_cipher(OSSL_RECORD_LAYER *rl, SSL3_RECORD *recs, size_t n_recs,
     }
 
     if (!rl->isdtls && rl->tlstree) {
-        unsigned char *seq;
         int decrement_seq = 0;
 
         /*
@@ -335,8 +346,9 @@ static int tls1_cipher(OSSL_RECORD_LAYER *rl, SSL3_RECORD *recs, size_t n_recs,
         if (sending && !rl->use_etm)
             decrement_seq = 1;
 
-        seq = rl->sequence;
-        if (EVP_CIPHER_CTX_ctrl(ds, EVP_CTRL_TLSTREE, decrement_seq, seq) <= 0) {
+        if (EVP_CIPHER_CTX_ctrl(ds, EVP_CTRL_TLSTREE, decrement_seq,
+                                rl->sequence) <= 0) {
+
             RLAYERfatal(rl, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
             return 0;
         }
@@ -449,13 +461,12 @@ static int tls1_cipher(OSSL_RECORD_LAYER *rl, SSL3_RECORD *recs, size_t n_recs,
     return 1;
 }
 
-static int tls1_mac(OSSL_RECORD_LAYER *rl, SSL3_RECORD *rec, unsigned char *md,
+static int tls1_mac(OSSL_RECORD_LAYER *rl, TLS_RL_RECORD *rec, unsigned char *md,
                     int sending)
 {
     unsigned char *seq = rl->sequence;
     EVP_MD_CTX *hash;
     size_t md_size;
-    int i;
     EVP_MD_CTX *hmac = NULL, *mac_ctx;
     unsigned char header[13];
     int t;
@@ -526,13 +537,11 @@ static int tls1_mac(OSSL_RECORD_LAYER *rl, SSL3_RECORD *rec, unsigned char *md,
         BIO_dump_indent(trc_out, rec->data, rec->length, 4);
     } OSSL_TRACE_END(TLS);
 
-    if (!rl->isdtls) {
-        for (i = 7; i >= 0; i--) {
-            ++seq[i];
-            if (seq[i] != 0)
-                break;
-        }
+    if (!rl->isdtls && !tls_increment_sequence_ctr(rl)) {
+        /* RLAYERfatal already called */
+        goto end;
     }
+
     OSSL_TRACE_BEGIN(TLS) {
         BIO_printf(trc_out, "md:\n");
         BIO_dump_indent(trc_out, md, md_size, 4);
@@ -593,11 +602,11 @@ int tls1_initialise_write_packets(OSSL_RECORD_LAYER *rl,
                                   size_t numtempl,
                                   OSSL_RECORD_TEMPLATE *prefixtempl,
                                   WPACKET *pkt,
-                                  SSL3_BUFFER *bufs,
+                                  TLS_BUFFER *bufs,
                                   size_t *wpinited)
 {
     size_t align = 0;
-    SSL3_BUFFER *wb;
+    TLS_BUFFER *wb;
     size_t prefix;
 
     /* Do we need to add an empty record prefix? */
@@ -617,14 +626,14 @@ int tls1_initialise_write_packets(OSSL_RECORD_LAYER *rl,
         wb = &bufs[0];
 
 #if defined(SSL3_ALIGN_PAYLOAD) && SSL3_ALIGN_PAYLOAD != 0
-        align = (size_t)SSL3_BUFFER_get_buf(wb) + SSL3_RT_HEADER_LENGTH;
+        align = (size_t)TLS_BUFFER_get_buf(wb) + SSL3_RT_HEADER_LENGTH;
         align = SSL3_ALIGN_PAYLOAD - 1
                 - ((align - 1) % SSL3_ALIGN_PAYLOAD);
 #endif
-        SSL3_BUFFER_set_offset(wb, align);
+        TLS_BUFFER_set_offset(wb, align);
 
-        if (!WPACKET_init_static_len(&pkt[0], SSL3_BUFFER_get_buf(wb),
-                                     SSL3_BUFFER_get_len(wb), 0)) {
+        if (!WPACKET_init_static_len(&pkt[0], TLS_BUFFER_get_buf(wb),
+                                     TLS_BUFFER_get_len(wb), 0)) {
             RLAYERfatal(rl, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
             return 0;
         }
@@ -642,7 +651,7 @@ int tls1_initialise_write_packets(OSSL_RECORD_LAYER *rl,
 }
 
 /* TLSv1.0, TLSv1.1 and TLSv1.2 all use the same funcs */
-struct record_functions_st tls_1_funcs = {
+const struct record_functions_st tls_1_funcs = {
     tls1_set_crypto_state,
     tls1_cipher,
     tls1_mac,
@@ -663,7 +672,7 @@ struct record_functions_st tls_1_funcs = {
     NULL
 };
 
-struct record_functions_st dtls_1_funcs = {
+const struct record_functions_st dtls_1_funcs = {
     tls1_set_crypto_state,
     tls1_cipher,
     tls1_mac,
@@ -673,12 +682,19 @@ struct record_functions_st dtls_1_funcs = {
     NULL,
     NULL,
     NULL,
+    tls_write_records_default,
+    /*
+     * Don't use tls1_allocate_write_buffers since that handles empty fragment
+     * records which aren't needed in DTLS. We just use the default allocation
+     * instead.
+     */
+    tls_allocate_write_buffers_default,
+    /* Don't use tls1_initialise_write_packets for same reason as above */
+    tls_initialise_write_packets_default,
     NULL,
+    dtls_prepare_record_header,
     NULL,
-    NULL,
-    NULL,
-    NULL,
-    NULL,
-    NULL,
+    tls_prepare_for_encryption_default,
+    dtls_post_encryption_processing,
     NULL
 };

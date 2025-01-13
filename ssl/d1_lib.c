@@ -1,5 +1,5 @@
 /*
- * Copyright 2005-2022 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2005-2024 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -8,6 +8,7 @@
  */
 
 #include "internal/e_os.h"
+#include "internal/e_winsock.h"          /* struct timeval for DTLS_CTRL_GET_TIMEOUT */
 #include <stdio.h>
 #include <openssl/objects.h>
 #include <openssl/rand.h>
@@ -21,8 +22,6 @@ static size_t dtls1_link_min_mtu(void);
 static const size_t g_probable_mtu[] = { 1500, 512, 256 };
 
 const SSL3_ENC_METHOD DTLSv1_enc_data = {
-    tls1_enc,
-    tls1_mac_old,
     tls1_setup_key_block,
     tls1_generate_master_secret,
     tls1_change_cipher_state,
@@ -31,15 +30,13 @@ const SSL3_ENC_METHOD DTLSv1_enc_data = {
     TLS_MD_SERVER_FINISH_CONST, TLS_MD_SERVER_FINISH_CONST_SIZE,
     tls1_alert_code,
     tls1_export_keying_material,
-    SSL_ENC_FLAG_DTLS | SSL_ENC_FLAG_EXPLICIT_IV,
+    SSL_ENC_FLAG_DTLS,
     dtls1_set_handshake_header,
     dtls1_close_construct_packet,
     dtls1_handshake_write
 };
 
 const SSL3_ENC_METHOD DTLSv1_2_enc_data = {
-    tls1_enc,
-    tls1_mac_old,
     tls1_setup_key_block,
     tls1_generate_master_secret,
     tls1_change_cipher_state,
@@ -48,7 +45,7 @@ const SSL3_ENC_METHOD DTLSv1_2_enc_data = {
     TLS_MD_SERVER_FINISH_CONST, TLS_MD_SERVER_FINISH_CONST_SIZE,
     tls1_alert_code,
     tls1_export_keying_material,
-    SSL_ENC_FLAG_DTLS | SSL_ENC_FLAG_EXPLICIT_IV | SSL_ENC_FLAG_SIGALGS
+    SSL_ENC_FLAG_DTLS | SSL_ENC_FLAG_SIGALGS
         | SSL_ENC_FLAG_SHA256_PRF | SSL_ENC_FLAG_TLS1_2_CIPHERS,
     dtls1_set_handshake_header,
     dtls1_close_construct_packet,
@@ -134,6 +131,17 @@ void dtls1_clear_sent_buffer(SSL_CONNECTION *s)
 
     while ((item = pqueue_pop(s->d1->sent_messages)) != NULL) {
         frag = (hm_fragment *)item->data;
+
+        if (frag->msg_header.is_ccs
+                && frag->msg_header.saved_retransmit_state.wrlmethod != NULL
+                && s->rlayer.wrl != frag->msg_header.saved_retransmit_state.wrl) {
+            /*
+             * If we're freeing the CCS then we're done with the old wrl and it
+             * can bee freed
+             */
+            frag->msg_header.saved_retransmit_state.wrlmethod->free(frag->msg_header.saved_retransmit_state.wrl);
+        }
+
         dtls1_hm_fragment_free(frag);
         pitem_free(item);
     }
@@ -147,15 +155,15 @@ void dtls1_free(SSL *ssl)
     if (s == NULL)
         return;
 
-    DTLS_RECORD_LAYER_free(&s->rlayer);
-
-    ssl3_free(ssl);
-
     if (s->d1 != NULL) {
         dtls1_clear_queues(s);
         pqueue_free(s->d1->buffered_messages);
         pqueue_free(s->d1->sent_messages);
     }
+
+    DTLS_RECORD_LAYER_free(&s->rlayer);
+
+    ssl3_free(ssl);
 
     OPENSSL_free(s->d1);
     s->d1 = NULL;
@@ -229,7 +237,7 @@ long dtls1_ctrl(SSL *ssl, int cmd, long larg, void *parg)
 
     switch (cmd) {
     case DTLS_CTRL_GET_TIMEOUT:
-        if (dtls1_get_timeout(s, &t) != NULL) {
+        if (dtls1_get_timeout(s, &t)) {
             *(struct timeval *)parg = ossl_time_to_timeval(t);
             ret = 1;
         }
@@ -260,9 +268,15 @@ long dtls1_ctrl(SSL *ssl, int cmd, long larg, void *parg)
     return ret;
 }
 
+static void dtls1_bio_set_next_timeout(BIO *bio, const DTLS1_STATE *d1)
+{
+    struct timeval tv = ossl_time_to_timeval(d1->next_timeout);
+
+    BIO_ctrl(bio, BIO_CTRL_DGRAM_SET_NEXT_TIMEOUT, 0, &tv);
+}
+
 void dtls1_start_timer(SSL_CONNECTION *s)
 {
-    struct timeval tv;
     OSSL_TIME duration;
     SSL *ssl = SSL_CONNECTION_GET_SSL(s);
 
@@ -289,17 +303,17 @@ void dtls1_start_timer(SSL_CONNECTION *s)
     duration = ossl_us2time(s->d1->timeout_duration_us);
     s->d1->next_timeout = ossl_time_add(ossl_time_now(), duration);
 
-    tv = ossl_time_to_timeval(s->d1->next_timeout);
-    BIO_ctrl(SSL_get_rbio(ssl), BIO_CTRL_DGRAM_SET_NEXT_TIMEOUT, 0, &tv);
+    /* set s->d1->next_timeout into ssl->rbio interface */
+    dtls1_bio_set_next_timeout(SSL_get_rbio(ssl), s->d1);
 }
 
-OSSL_TIME *dtls1_get_timeout(SSL_CONNECTION *s, OSSL_TIME *timeleft)
+int dtls1_get_timeout(const SSL_CONNECTION *s, OSSL_TIME *timeleft)
 {
     OSSL_TIME timenow;
 
     /* If no timeout is set, just return NULL */
     if (ossl_time_is_zero(s->d1->next_timeout))
-        return NULL;
+        return 0;
 
     /* Get current time */
     timenow = ossl_time_now();
@@ -312,7 +326,7 @@ OSSL_TIME *dtls1_get_timeout(SSL_CONNECTION *s, OSSL_TIME *timeleft)
     *timeleft = ossl_time_subtract(s->d1->next_timeout, timenow);
     if (ossl_time_compare(*timeleft, ossl_ms2time(15)) <= 0)
         *timeleft = ossl_time_zero();
-    return timeleft;
+    return 1;
 }
 
 int dtls1_is_timer_expired(SSL_CONNECTION *s)
@@ -320,14 +334,12 @@ int dtls1_is_timer_expired(SSL_CONNECTION *s)
     OSSL_TIME timeleft;
 
     /* Get time left until timeout, return false if no timer running */
-    if (dtls1_get_timeout(s, &timeleft) == NULL) {
+    if (!dtls1_get_timeout(s, &timeleft))
         return 0;
-    }
 
     /* Return false if timer is not expired yet */
-    if (!ossl_time_is_zero(timeleft)) {
+    if (!ossl_time_is_zero(timeleft))
         return 0;
-    }
 
     /* Timer expired, so return true */
     return 1;
@@ -342,14 +354,11 @@ static void dtls1_double_timeout(SSL_CONNECTION *s)
 
 void dtls1_stop_timer(SSL_CONNECTION *s)
 {
-    struct timeval tv;
-
     /* Reset everything */
     s->d1->timeout_num_alerts = 0;
     s->d1->next_timeout = ossl_time_zero();
     s->d1->timeout_duration_us = 1000000;
-    tv = ossl_time_to_timeval(s->d1->next_timeout);
-    BIO_ctrl(s->rbio, BIO_CTRL_DGRAM_SET_NEXT_TIMEOUT, 0, &tv);
+    dtls1_bio_set_next_timeout(s->rbio, s->d1);
     /* Clear retransmission buffer */
     dtls1_clear_sent_buffer(s);
 }
@@ -387,7 +396,7 @@ int dtls1_handle_timeout(SSL_CONNECTION *s)
     }
 
     if (s->d1->timer_cb != NULL)
-        s->d1->timeout_duration_us = s->d1->timer_cb(SSL_CONNECTION_GET_SSL(s),
+        s->d1->timeout_duration_us = s->d1->timer_cb(SSL_CONNECTION_GET_USER_SSL(s),
                                                      s->d1->timeout_duration_us);
     else
         dtls1_double_timeout(s);
@@ -414,7 +423,7 @@ int DTLSv1_listen(SSL *ssl, BIO_ADDR *client)
     const unsigned char *data;
     unsigned char *buf = NULL, *wbuf;
     size_t fragoff, fraglen, msglen;
-    unsigned int rectype, versmajor, msgseq, msgtype, clientvers, cookielen;
+    unsigned int rectype, versmajor, versminor, msgseq, msgtype, clientvers, cookielen;
     BIO *rbio, *wbio;
     BIO_ADDR *tmpclient = NULL;
     PACKET pkt, msgpkt, msgpayload, session, cookiepkt;
@@ -454,14 +463,14 @@ int DTLSv1_listen(SSL *ssl, BIO_ADDR *client)
         return -1;
     }
 
-    if (!ssl3_setup_buffers(s)) {
-        /* ERR_raise() already called */
-        return -1;
-    }
     buf = OPENSSL_malloc(DTLS1_RT_HEADER_LENGTH + SSL3_RT_MAX_PLAIN_LENGTH);
     if (buf == NULL)
         return -1;
-    wbuf = RECORD_LAYER_get_wbuf(&s->rlayer)[0].buf;
+    wbuf = OPENSSL_malloc(DTLS1_RT_HEADER_LENGTH + SSL3_RT_MAX_PLAIN_LENGTH);
+    if (wbuf == NULL) {
+        OPENSSL_free(buf);
+        return -1;
+    }
 
     do {
         /* Get a packet */
@@ -499,16 +508,17 @@ int DTLSv1_listen(SSL *ssl, BIO_ADDR *client)
             goto end;
         }
 
-        if (s->msg_callback)
-            s->msg_callback(0, 0, SSL3_RT_HEADER, buf,
-                            DTLS1_RT_HEADER_LENGTH, ssl, s->msg_callback_arg);
-
         /* Get the record header */
         if (!PACKET_get_1(&pkt, &rectype)
-            || !PACKET_get_1(&pkt, &versmajor)) {
+            || !PACKET_get_1(&pkt, &versmajor)
+            || !PACKET_get_1(&pkt, &versminor)) {
             ERR_raise(ERR_LIB_SSL, SSL_R_LENGTH_MISMATCH);
             goto end;
         }
+
+        if (s->msg_callback)
+            s->msg_callback(0, (versmajor << 8) | versminor, SSL3_RT_HEADER, buf,
+                            DTLS1_RT_HEADER_LENGTH, ssl, s->msg_callback_arg);
 
         if (rectype != SSL3_RT_HANDSHAKE) {
             ERR_raise(ERR_LIB_SSL, SSL_R_UNEXPECTED_MESSAGE);
@@ -524,9 +534,8 @@ int DTLSv1_listen(SSL *ssl, BIO_ADDR *client)
             goto end;
         }
 
-        if (!PACKET_forward(&pkt, 1)
-            /* Save the sequence number: 64 bits, with top 2 bytes = epoch */
-            || !PACKET_copy_bytes(&pkt, seq, SEQ_NUM_SIZE)
+        /* Save the sequence number: 64 bits, with top 2 bytes = epoch */
+        if (!PACKET_copy_bytes(&pkt, seq, SEQ_NUM_SIZE)
             || !PACKET_get_length_prefixed_2(&pkt, &msgpkt)) {
             ERR_raise(ERR_LIB_SSL, SSL_R_LENGTH_MISMATCH);
             goto end;
@@ -790,7 +799,7 @@ int DTLSv1_listen(SSL *ssl, BIO_ADDR *client)
     s->d1->handshake_read_seq = 1;
     s->d1->handshake_write_seq = 1;
     s->d1->next_handshake_write_seq = 1;
-    DTLS_RECORD_LAYER_set_write_sequence(&s->rlayer, seq);
+    s->rlayer.wrlmethod->increment_sequence_ctr(s->rlayer.wrl);
 
     /*
      * We are doing cookie exchange, so make sure we set that option in the
@@ -824,9 +833,9 @@ int DTLSv1_listen(SSL *ssl, BIO_ADDR *client)
     if (!ssl_set_new_record_layer(s,
                                   DTLS_ANY_VERSION,
                                   OSSL_RECORD_DIRECTION_READ,
-                                  OSSL_RECORD_PROTECTION_LEVEL_NONE,
+                                  OSSL_RECORD_PROTECTION_LEVEL_NONE, NULL, 0,
                                   NULL, 0, NULL, 0, NULL,  0, NULL, 0,
-                                  NID_undef, NULL, NULL)) {
+                                  NID_undef, NULL, NULL, NULL)) {
         /* SSLfatal already called */
         ret = -1;
         goto end;
@@ -836,6 +845,7 @@ int DTLSv1_listen(SSL *ssl, BIO_ADDR *client)
  end:
     BIO_ADDR_free(tmpclient);
     OPENSSL_free(buf);
+    OPENSSL_free(wbuf);
     return ret;
 }
 #endif

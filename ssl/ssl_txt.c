@@ -1,5 +1,5 @@
 /*
- * Copyright 1995-2022 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 1995-2024 The OpenSSL Project Authors. All Rights Reserved.
  * Copyright 2005 Nokia. All rights reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
@@ -11,6 +11,8 @@
 #include <stdio.h>
 #include <openssl/buffer.h>
 #include "ssl_local.h"
+
+#include "internal/comp.h"
 
 #ifndef OPENSSL_NO_STDIO
 int SSL_SESSION_print_fp(FILE *fp, const SSL_SESSION *x)
@@ -153,7 +155,7 @@ int SSL_SESSION_print(BIO *bp, const SSL_SESSION *x)
 
     if (istls13) {
         if (BIO_printf(bp, "    Max Early Data: %u\n",
-                       x->ext.max_early_data) <= 0)
+                       (unsigned int)x->ext.max_early_data) <= 0)
             goto err;
     }
 

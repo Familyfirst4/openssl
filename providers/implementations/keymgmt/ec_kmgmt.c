@@ -1,5 +1,5 @@
 /*
- * Copyright 2020-2022 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2020-2024 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -25,6 +25,7 @@
 #include "prov/implementations.h"
 #include "prov/providercommon.h"
 #include "prov/provider_ctx.h"
+#include "prov/securitycheck.h"
 #include "internal/param_build_set.h"
 
 #ifndef FIPS_MODULE
@@ -38,6 +39,8 @@ static OSSL_FUNC_keymgmt_gen_init_fn ec_gen_init;
 static OSSL_FUNC_keymgmt_gen_set_template_fn ec_gen_set_template;
 static OSSL_FUNC_keymgmt_gen_set_params_fn ec_gen_set_params;
 static OSSL_FUNC_keymgmt_gen_settable_params_fn ec_gen_settable_params;
+static OSSL_FUNC_keymgmt_gen_get_params_fn ec_gen_get_params;
+static OSSL_FUNC_keymgmt_gen_gettable_params_fn ec_gen_gettable_params;
 static OSSL_FUNC_keymgmt_gen_fn ec_gen;
 static OSSL_FUNC_keymgmt_gen_cleanup_fn ec_gen_cleanup;
 static OSSL_FUNC_keymgmt_load_fn ec_load;
@@ -147,8 +150,10 @@ int key_to_params(const EC_KEY *eckey, OSSL_PARAM_BLD *tmpl,
 
         if (p != NULL || tmpl != NULL) {
             /* convert pub_point to a octet string according to the SECG standard */
+            point_conversion_form_t format = EC_KEY_get_conv_form(eckey);
+
             if ((pub_key_len = EC_POINT_point2buf(ecg, pub_point,
-                                                  POINT_CONVERSION_COMPRESSED,
+                                                  format,
                                                   pub_key, bnctx)) == 0
                 || !ossl_param_build_set_octet_string(tmpl, p,
                                                       OSSL_PKEY_PARAM_PUB_KEY,
@@ -156,10 +161,16 @@ int key_to_params(const EC_KEY *eckey, OSSL_PARAM_BLD *tmpl,
                 goto err;
         }
         if (px != NULL || py != NULL) {
-            if (px != NULL)
+            if (px != NULL) {
                 x = BN_CTX_get(bnctx);
-            if (py != NULL)
+                if (x == NULL)
+                    goto err;
+            }
+            if (py != NULL) {
                 y = BN_CTX_get(bnctx);
+                if (y == NULL)
+                    goto err;
+            }
 
             if (!EC_POINT_get_affine_coordinates(ecg, pub_point, x, y, bnctx))
                 goto err;
@@ -737,7 +748,7 @@ int common_get_params(void *key, OSSL_PARAM params[], int sm2)
         }
         p->return_size = EC_POINT_point2oct(ecg, ecp,
                                             POINT_CONVERSION_UNCOMPRESSED,
-                                            p->data, p->return_size, bnctx);
+                                            p->data, p->data_size, bnctx);
         if (p->return_size == 0)
             goto err;
     }
@@ -821,9 +832,8 @@ int ec_set_params(void *key, const OSSL_PARAM params[])
 
     if (key == NULL)
         return 0;
-    if (params == NULL)
+    if (ossl_param_is_empty(params))
         return 1;
-
 
     if (!ossl_ec_group_set_params((EC_GROUP *)EC_KEY_get0_group(key), params))
         return 0;
@@ -946,7 +956,7 @@ int ec_validate(const void *keydata, int selection, int checktype)
 
         if ((flags & EC_FLAG_CHECK_NAMED_GROUP) != 0)
             ok = ok && EC_GROUP_check_named_curve(EC_KEY_get0_group(eck),
-                           (flags & EC_FLAG_CHECK_NAMED_GROUP_NIST) != 0, ctx);
+                           (flags & EC_FLAG_CHECK_NAMED_GROUP_NIST) != 0, ctx) > 0;
         else
             ok = ok && EC_GROUP_check(EC_KEY_get0_group(eck), ctx);
     }
@@ -983,6 +993,7 @@ struct ec_gen_ctx {
     EC_GROUP *gen_group;
     unsigned char *dhkem_ikm;
     size_t dhkem_ikmlen;
+    OSSL_FIPS_IND_DECLARE
 };
 
 static void *ec_gen_init(void *provctx, int selection,
@@ -998,10 +1009,11 @@ static void *ec_gen_init(void *provctx, int selection,
         gctx->libctx = libctx;
         gctx->selection = selection;
         gctx->ecdh_mode = 0;
-    }
-    if (!ec_gen_set_params(gctx, params)) {
-        OPENSSL_free(gctx);
-        gctx = NULL;
+        OSSL_FIPS_IND_INIT(gctx)
+        if (!ec_gen_set_params(gctx, params)) {
+            OPENSSL_free(gctx);
+            gctx = NULL;
+        }
     }
     return gctx;
 }
@@ -1096,6 +1108,10 @@ static int ec_gen_set_params(void *genctx, const OSSL_PARAM params[])
     struct ec_gen_ctx *gctx = genctx;
     const OSSL_PARAM *p;
     EC_GROUP *group = NULL;
+
+    if (!OSSL_FIPS_IND_SET_CTX_PARAM(gctx, OSSL_FIPS_IND_SETTABLE0, params,
+                                     OSSL_PKEY_PARAM_FIPS_KEY_CHECK))
+        goto err;
 
     COPY_INT_PARAM(params, OSSL_PKEY_PARAM_USE_COFACTOR_ECDH, gctx->ecdh_mode);
 
@@ -1218,10 +1234,33 @@ static const OSSL_PARAM *ec_gen_settable_params(ossl_unused void *genctx,
         OSSL_PARAM_BN(OSSL_PKEY_PARAM_EC_COFACTOR, NULL, 0),
         OSSL_PARAM_octet_string(OSSL_PKEY_PARAM_EC_SEED, NULL, 0),
         OSSL_PARAM_octet_string(OSSL_PKEY_PARAM_DHKEM_IKM, NULL, 0),
+        OSSL_FIPS_IND_SETTABLE_CTX_PARAM(OSSL_PKEY_PARAM_FIPS_KEY_CHECK)
         OSSL_PARAM_END
     };
-
     return settable;
+}
+
+static const OSSL_PARAM *ec_gen_gettable_params(ossl_unused void *genctx,
+                                                ossl_unused void *provctx)
+{
+    static const OSSL_PARAM known_ec_gen_gettable_ctx_params[] = {
+        OSSL_FIPS_IND_GETTABLE_CTX_PARAM()
+        OSSL_PARAM_END
+    };
+    return known_ec_gen_gettable_ctx_params;
+}
+
+static int ec_gen_get_params(void *genctx, OSSL_PARAM *params)
+{
+    struct ec_gen_ctx *gctx = genctx;
+
+    if (gctx == NULL)
+        return 0;
+
+    if (!OSSL_FIPS_IND_GET_CTX_PARAM(gctx, params))
+        return 0;
+
+    return 1;
 }
 
 static int ec_gen_assign_group(EC_KEY *ec, EC_GROUP *group)
@@ -1266,6 +1305,16 @@ static void *ec_gen(void *genctx, OSSL_CALLBACK *osslcb, void *cbarg)
             EC_GROUP_set_point_conversion_form(gctx->gen_group, format);
         }
     }
+#ifdef FIPS_MODULE
+    if (!ossl_ec_check_security_strength(gctx->gen_group, 1)) {
+        if (!OSSL_FIPS_IND_ON_UNAPPROVED(gctx, OSSL_FIPS_IND_SETTABLE0,
+                                         gctx->libctx, "EC KeyGen", "key size",
+                                         ossl_fips_config_securitycheck_enabled)) {
+            ERR_raise(ERR_LIB_PROV, PROV_R_INVALID_KEY_LENGTH);
+            goto err;
+        }
+    }
+#endif
 
     /* We must always assign a group, no matter what */
     ret = ec_gen_assign_group(ec, gctx->gen_group);
@@ -1418,6 +1467,9 @@ const OSSL_DISPATCH ossl_ec_keymgmt_functions[] = {
     { OSSL_FUNC_KEYMGMT_GEN_SET_PARAMS, (void (*)(void))ec_gen_set_params },
     { OSSL_FUNC_KEYMGMT_GEN_SETTABLE_PARAMS,
       (void (*)(void))ec_gen_settable_params },
+    { OSSL_FUNC_KEYMGMT_GEN_GET_PARAMS, (void (*)(void))ec_gen_get_params },
+    { OSSL_FUNC_KEYMGMT_GEN_GETTABLE_PARAMS,
+      (void (*)(void))ec_gen_gettable_params },
     { OSSL_FUNC_KEYMGMT_GEN, (void (*)(void))ec_gen },
     { OSSL_FUNC_KEYMGMT_GEN_CLEANUP, (void (*)(void))ec_gen_cleanup },
     { OSSL_FUNC_KEYMGMT_LOAD, (void (*)(void))ec_load },
@@ -1436,7 +1488,7 @@ const OSSL_DISPATCH ossl_ec_keymgmt_functions[] = {
     { OSSL_FUNC_KEYMGMT_QUERY_OPERATION_NAME,
       (void (*)(void))ec_query_operation_name },
     { OSSL_FUNC_KEYMGMT_DUP, (void (*)(void))ec_dup },
-    { 0, NULL }
+    OSSL_DISPATCH_END
 };
 
 #ifndef FIPS_MODULE
@@ -1467,7 +1519,7 @@ const OSSL_DISPATCH ossl_sm2_keymgmt_functions[] = {
     { OSSL_FUNC_KEYMGMT_QUERY_OPERATION_NAME,
       (void (*)(void))sm2_query_operation_name },
     { OSSL_FUNC_KEYMGMT_DUP, (void (*)(void))ec_dup },
-    { 0, NULL }
+    OSSL_DISPATCH_END
 };
 # endif
 #endif

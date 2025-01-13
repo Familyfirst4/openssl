@@ -1,5 +1,5 @@
 /*
- * Copyright 2020-2022 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2020-2024 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -25,6 +25,7 @@
 #include "crypto/ec.h"
 #include "ec_local.h"
 #include "internal/e_os.h"
+#include "internal/nelem.h"
 #include "internal/param_build_set.h"
 
 /* Mapping between a flag and a name */
@@ -183,8 +184,7 @@ static int ec_group_explicit_todata(const EC_GROUP *group, OSSL_PARAM_BLD *tmpl,
     param_p = OSSL_PARAM_locate_const(params, OSSL_PKEY_PARAM_EC_P);
     param_a = OSSL_PARAM_locate_const(params, OSSL_PKEY_PARAM_EC_A);
     param_b = OSSL_PARAM_locate_const(params, OSSL_PKEY_PARAM_EC_B);
-    if (tmpl != NULL || param_p != NULL || param_a != NULL || param_b != NULL)
-    {
+    if (tmpl != NULL || param_p != NULL || param_a != NULL || param_b != NULL) {
         BIGNUM *p = BN_CTX_get(bnctx);
         BIGNUM *a = BN_CTX_get(bnctx);
         BIGNUM *b = BN_CTX_get(bnctx);
@@ -616,14 +616,8 @@ EC_KEY *ossl_ec_key_dup(const EC_KEY *src, int selection)
             || !EC_GROUP_copy(ret->group, src->group))
             goto err;
 
-        if (src->meth != NULL) {
-#if !defined(OPENSSL_NO_ENGINE) && !defined(FIPS_MODULE)
-            if (src->engine != NULL && ENGINE_init(src->engine) == 0)
-                goto err;
-            ret->engine = src->engine;
-#endif
+        if (src->meth != NULL)
             ret->meth = src->meth;
-        }
     }
 
     /*  copy the public key */
