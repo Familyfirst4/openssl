@@ -1,5 +1,5 @@
 /*
- * Copyright 2005-2020 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2005-2023 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -9,8 +9,8 @@
 
 #include "ssl_local.h"
 
-int dtls1_write_app_data_bytes(SSL *s, int type, const void *buf_, size_t len,
-                               size_t *written)
+int dtls1_write_app_data_bytes(SSL *s, uint8_t type, const void *buf_,
+                               size_t len, size_t *written)
 {
     int i;
     SSL_CONNECTION *sc = SSL_CONNECTION_FROM_SSL_ONLY(s);
@@ -48,13 +48,13 @@ int dtls1_dispatch_alert(SSL *ssl)
     if (s == NULL)
         return 0;
 
-    s->s3.alert_dispatch = 0;
+    s->s3.alert_dispatch = SSL_ALERT_DISPATCH_NONE;
 
     memset(buf, 0, sizeof(buf));
     *ptr++ = s->s3.send_alert[0];
     *ptr++ = s->s3.send_alert[1];
 
-    i = do_dtls1_write(s, SSL3_RT_ALERT, &buf[0], sizeof(buf), 0, &written);
+    i = do_dtls1_write(s, SSL3_RT_ALERT, &buf[0], sizeof(buf), &written);
     if (i <= 0) {
         s->s3.alert_dispatch = 1;
         /* fprintf(stderr, "not done with alert\n"); */

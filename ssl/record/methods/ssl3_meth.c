@@ -1,5 +1,5 @@
 /*
- * Copyright 2022 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2022-2024 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -9,6 +9,7 @@
 
 #include <openssl/evp.h>
 #include <openssl/core_names.h>
+#include "internal/ssl3_cbc.h"
 #include "../../ssl_local.h"
 #include "../record_local.h"
 #include "recmethod_local.h"
@@ -63,7 +64,11 @@ static int ssl3_set_crypto_state(OSSL_RECORD_LAYER *rl, int level,
         return OSSL_RECORD_RETURN_FATAL;
     }
 
-    if (EVP_CIPHER_get0_provider(ciph) != NULL
+    /*
+     * The cipher we actually ended up using in the EVP_CIPHER_CTX may be
+     * different to that in ciph if we have an ENGINE in use
+     */
+    if (EVP_CIPHER_get0_provider(EVP_CIPHER_CTX_get0_cipher(ciph_ctx)) != NULL
             && !ossl_set_tls_provider_parameters(rl, ciph_ctx, ciph, md)) {
         /* ERR_raise already called */
         return OSSL_RECORD_RETURN_FATAL;
@@ -87,10 +92,11 @@ static int ssl3_set_crypto_state(OSSL_RECORD_LAYER *rl, int level,
  *    0: if the record is publicly invalid, or an internal error
  *    1: Success or Mac-then-encrypt decryption failed (MAC will be randomised)
  */
-static int ssl3_cipher(OSSL_RECORD_LAYER *rl, SSL3_RECORD *inrecs, size_t n_recs,
-                       int sending, SSL_MAC_BUF *mac, size_t macsize)
+static int ssl3_cipher(OSSL_RECORD_LAYER *rl, TLS_RL_RECORD *inrecs,
+                       size_t n_recs, int sending, SSL_MAC_BUF *mac,
+                       size_t macsize)
 {
-    SSL3_RECORD *rec;
+    TLS_RL_RECORD *rec;
     EVP_CIPHER_CTX *ds;
     size_t l, i;
     size_t bs;
@@ -112,6 +118,9 @@ static int ssl3_cipher(OSSL_RECORD_LAYER *rl, SSL3_RECORD *inrecs, size_t n_recs
 
     l = rec->length;
     bs = EVP_CIPHER_CTX_get_block_size(ds);
+
+    if (bs == 0)
+        return 0;
 
     /* COMPRESS */
 
@@ -206,7 +215,7 @@ static const unsigned char ssl3_pad_2[48] = {
     0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c
 };
 
-static int ssl3_mac(OSSL_RECORD_LAYER *rl, SSL3_RECORD *rec, unsigned char *md,
+static int ssl3_mac(OSSL_RECORD_LAYER *rl, TLS_RL_RECORD *rec, unsigned char *md,
                     int sending)
 {
     unsigned char *mac_sec, *seq = rl->sequence;
@@ -220,7 +229,7 @@ static int ssl3_mac(OSSL_RECORD_LAYER *rl, SSL3_RECORD *rec, unsigned char *md,
     hash = rl->md_ctx;
 
     t = EVP_MD_CTX_get_size(hash);
-    if (t < 0)
+    if (t <= 0)
         return 0;
     md_size = t;
     npad = (48 / md_size) * md_size;
@@ -296,11 +305,13 @@ static int ssl3_mac(OSSL_RECORD_LAYER *rl, SSL3_RECORD *rec, unsigned char *md,
         EVP_MD_CTX_free(md_ctx);
     }
 
-    ssl3_record_sequence_update(seq);
+    if (!tls_increment_sequence_ctr(rl))
+        return 0;
+
     return 1;
 }
 
-struct record_functions_st ssl_3_0_funcs = {
+const struct record_functions_st ssl_3_0_funcs = {
     ssl3_set_crypto_state,
     ssl3_cipher,
     ssl3_mac,

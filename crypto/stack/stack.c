@@ -1,5 +1,5 @@
 /*
- * Copyright 1995-2021 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 1995-2024 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -297,6 +297,9 @@ void *OPENSSL_sk_delete_ptr(OPENSSL_STACK *st, const void *p)
 {
     int i;
 
+    if (st == NULL)
+        return NULL;
+
     for (i = 0; i < st->num; i++)
         if (st->data[i] == p)
             return internal_delete(st, i);
@@ -305,53 +308,61 @@ void *OPENSSL_sk_delete_ptr(OPENSSL_STACK *st, const void *p)
 
 void *OPENSSL_sk_delete(OPENSSL_STACK *st, int loc)
 {
-    if (st == NULL) {
-        ERR_raise(ERR_LIB_X509, ERR_R_PASSED_NULL_PARAMETER);
+    if (st == NULL || loc < 0 || loc >= st->num)
         return NULL;
-    }
-    if (loc < 0 || loc >= st->num) {
-        ERR_raise_data(ERR_LIB_X509, ERR_R_PASSED_INVALID_ARGUMENT,
-                       "loc=%d", loc);
-        return NULL;
-    }
 
     return internal_delete(st, loc);
 }
 
 static int internal_find(OPENSSL_STACK *st, const void *data,
-                         int ret_val_options, int *pnum)
+                         int ret_val_options, int *pnum_matched)
 {
     const void *r;
-    int i;
+    int i, count = 0;
+    int *pnum = pnum_matched;
 
     if (st == NULL || st->num == 0)
         return -1;
 
+    if (pnum == NULL)
+        pnum = &count;
+
     if (st->comp == NULL) {
         for (i = 0; i < st->num; i++)
             if (st->data[i] == data) {
-                if (pnum != NULL)
-                    *pnum = 1;
+                *pnum = 1;
                 return i;
             }
-        if (pnum != NULL)
-            *pnum = 0;
+        *pnum = 0;
         return -1;
     }
 
-    if (!st->sorted) {
-        if (st->num > 1)
-            qsort(st->data, st->num, sizeof(void *), st->comp);
-        st->sorted = 1; /* empty or single-element stack is considered sorted */
-    }
     if (data == NULL)
         return -1;
-    if (pnum != NULL)
+
+    if (!st->sorted) {
+        int res = -1;
+
+        for (i = 0; i < st->num; i++)
+            if (st->comp(&data, st->data + i) == 0) {
+                if (res == -1)
+                    res = i;
+                ++*pnum;
+                /* Check if only one result is wanted and exit if so */
+                if (pnum_matched == NULL)
+                    return i;
+            }
+        if (res == -1)
+            *pnum = 0;
+        return res;
+    }
+
+    if (pnum_matched != NULL)
         ret_val_options |= OSSL_BSEARCH_FIRST_VALUE_ON_MATCH;
     r = ossl_bsearch(&data, st->data, st->num, sizeof(void *), st->comp,
                      ret_val_options);
 
-    if (pnum != NULL) {
+    if (pnum_matched != NULL) {
         *pnum = 0;
         if (r != NULL) {
             const void **p = (const void **)r;
@@ -386,7 +397,7 @@ int OPENSSL_sk_find_all(OPENSSL_STACK *st, const void *data, int *pnum)
 int OPENSSL_sk_push(OPENSSL_STACK *st, const void *data)
 {
     if (st == NULL)
-        return -1;
+        return 0;
     return OPENSSL_sk_insert(st, data, st->num);
 }
 
@@ -397,37 +408,21 @@ int OPENSSL_sk_unshift(OPENSSL_STACK *st, const void *data)
 
 void *OPENSSL_sk_shift(OPENSSL_STACK *st)
 {
-    if (st == NULL) {
-        ERR_raise(ERR_LIB_X509, ERR_R_PASSED_NULL_PARAMETER);
+    if (st == NULL || st->num == 0)
         return NULL;
-    }
-    if (st->num == 0) {
-        ERR_raise(ERR_LIB_X509, ERR_R_PASSED_INVALID_ARGUMENT);
-        return NULL;
-    }
     return internal_delete(st, 0);
 }
 
 void *OPENSSL_sk_pop(OPENSSL_STACK *st)
 {
-    if (st == NULL) {
-        ERR_raise(ERR_LIB_X509, ERR_R_PASSED_NULL_PARAMETER);
+    if (st == NULL || st->num == 0)
         return NULL;
-    }
-    if (st->num == 0) {
-        ERR_raise(ERR_LIB_X509, ERR_R_PASSED_INVALID_ARGUMENT);
-        return NULL;
-    }
     return internal_delete(st, st->num - 1);
 }
 
 void OPENSSL_sk_zero(OPENSSL_STACK *st)
 {
-    if (st == NULL) {
-        ERR_raise(ERR_LIB_X509, ERR_R_PASSED_NULL_PARAMETER);
-        return;
-    }
-    if (st->num == 0)
+    if (st == NULL || st->num == 0)
         return;
     memset(st->data, 0, sizeof(*st->data) * st->num);
     st->num = 0;
@@ -460,26 +455,19 @@ int OPENSSL_sk_num(const OPENSSL_STACK *st)
 
 void *OPENSSL_sk_value(const OPENSSL_STACK *st, int i)
 {
-    if (st == NULL) {
-        ERR_raise(ERR_LIB_X509, ERR_R_PASSED_NULL_PARAMETER);
+    if (st == NULL || i < 0 || i >= st->num)
         return NULL;
-    }
-    if (i < 0 || i >= st->num) {
-        ERR_raise_data(ERR_LIB_X509, ERR_R_PASSED_INVALID_ARGUMENT,
-                       "i=%d", i);
-        return NULL;
-    }
     return (void *)st->data[i];
 }
 
 void *OPENSSL_sk_set(OPENSSL_STACK *st, int i, const void *data)
 {
     if (st == NULL) {
-        ERR_raise(ERR_LIB_X509, ERR_R_PASSED_NULL_PARAMETER);
+        ERR_raise(ERR_LIB_CRYPTO, ERR_R_PASSED_NULL_PARAMETER);
         return NULL;
     }
     if (i < 0 || i >= st->num) {
-        ERR_raise_data(ERR_LIB_X509, ERR_R_PASSED_INVALID_ARGUMENT,
+        ERR_raise_data(ERR_LIB_CRYPTO, ERR_R_PASSED_INVALID_ARGUMENT,
                        "i=%d", i);
         return NULL;
     }

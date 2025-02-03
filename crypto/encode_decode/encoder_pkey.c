@@ -1,5 +1,5 @@
 /*
- * Copyright 2019-2022 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2019-2023 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -103,14 +103,15 @@ static void collect_encoder(OSSL_ENCODER *encoder, void *arg)
      */
     if ((data->keymgmt_prov == prov) == data->flag_find_same_provider) {
         void *provctx = OSSL_PROVIDER_get0_provider_ctx(prov);
-        size_t i, end_i = sk_OPENSSL_CSTRING_num(data->names);
+        int i, end_i = sk_OPENSSL_CSTRING_num(data->names);
         int match;
 
         for (i = 0; i < end_i; i++) {
             if (data->flag_find_same_provider)
                 match = (data->id_names[i] == encoder->base.id);
             else
-                match = OSSL_ENCODER_is_a(encoder, sk_OPENSSL_CSTRING_value(data->names, i));
+                match = OSSL_ENCODER_is_a(encoder,
+                                          sk_OPENSSL_CSTRING_value(data->names, i));
             if (!match
                 || (encoder->does_selection != NULL
                     && !encoder->does_selection(provctx, data->ctx->selection))
@@ -188,9 +189,13 @@ encoder_construct_pkey(OSSL_ENCODER_INSTANCE *encoder_inst, void *arg)
         const OSSL_PROVIDER *e_prov = OSSL_ENCODER_get0_provider(encoder);
 
         if (k_prov != e_prov) {
+            int selection = data->selection;
+
+            if ((selection & OSSL_KEYMGMT_SELECT_PRIVATE_KEY) != 0)
+                selection |= OSSL_KEYMGMT_SELECT_PUBLIC_KEY;
             data->encoder_inst = encoder_inst;
 
-            if (!evp_keymgmt_export(pk->keymgmt, pk->keydata, data->selection,
+            if (!evp_keymgmt_export(pk->keymgmt, pk->keydata, selection,
                                     &encoder_import_cb, data))
                 return NULL;
             data->obj = data->constructed_obj;
@@ -283,8 +288,10 @@ static int ossl_encoder_ctx_setup_for_pkey(OSSL_ENCODER_CTX *ctx,
         end = sk_OPENSSL_CSTRING_num(encoder_data.names);
         if (end > 0) {
             encoder_data.id_names = OPENSSL_malloc(end * sizeof(int));
-            if (encoder_data.id_names == NULL)
+            if (encoder_data.id_names == NULL) {
+                sk_OPENSSL_CSTRING_free(keymgmt_data.names);
                 goto err;
+            }
             for (i = 0; i < end; ++i) {
                 const char *name = sk_OPENSSL_CSTRING_value(keymgmt_data.names, i);
 
